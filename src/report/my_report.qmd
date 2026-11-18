@@ -1,0 +1,1194 @@
+---
+title: "Forecasting Post-Earnings Drift in the S&P 500"
+subtitle: "Technical, fundamental and language signals, walk-forward models, and a trading backtest"
+author: "Sushmita"
+date: "Summer 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    css: mobile.css
+    grid:
+      sidebar-width: 230px
+      body-width: 1000px
+      margin-width: 200px
+    embed-resources: true
+    include-after-body: mobile.html
+jupyter: python3
+execute:
+  freeze: auto
+  cache: true
+---
+
+::: {.callout-note appearance="simple"}
+**Group capstone project** (Ontario Tech University, MBAI 5600G, Summer 2026, team of 3).
+This is my write-up of the project. Code and data come from the
+[team repository](https://github.com/Richard-X46/Post-Earnings-Forecast);
+my fork lives at <https://github.com/Sushmitab93/Post-Earnings-Forecast>.
+:::
+
+## Overview
+
+When a company reports earnings, its stock rarely finishes reacting on the
+same day. This project asks whether that delayed reaction can be predicted,
+and whether the prediction is good enough to trade. The sections below move
+from the problem itself, through the data (coverage, sectors, fundamentals,
+price behaviour, sentiment), to model design, model results, and finally a
+backtested trading strategy. All charts and figures are computed fresh from
+the project's `data/` subset each time this page is built.
+
+```{python}
+#| label: setup
+#| output: false
+from pathlib import Path
+import polars as pl
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sklearn.metrics import confusion_matrix
+import numpy as np
+from IPython.display import HTML, display
+import plotly.io as pio
+
+DATA = Path("data") if Path("data").exists() else Path("src/report/data")
+assert DATA.exists(), f"data dir not found from {Path.cwd()}"
+
+# Single-colour template: one monochromatic blue family for every chart.
+BLUE = "#1f5fa8"        # primary data colour (TabNet, single series)
+TEAL = "#0f766e"        # contrast hue: DNN series wherever the models meet
+BLUE_DARK = "#0b3d6e"   # emphasis / third series
+BLUE_MID = "#4d94d6"    # sequential intensity steps (thresholds, classes)
+BLUE_LIGHT = "#aecbeb"  # fills, sequential steps
+BLUE_PALE = "#dbe7f5"   # background bands
+GREY = "#8a94a6"        # reference lines, annotations, loss bars
+GREY_PALE = "#e3e7ee"   # gridlines
+INK = "#1a2333"         # text
+
+pio.templates["pead"] = go.layout.Template(
+    layout=dict(
+        colorway=[BLUE, TEAL, BLUE_DARK, BLUE_LIGHT],
+        font=dict(color=INK),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        xaxis=dict(showgrid=True, gridcolor=GREY_PALE, linecolor=GREY,
+                   zerolinecolor=GREY_PALE),
+        yaxis=dict(showgrid=True, gridcolor=GREY_PALE, linecolor=GREY,
+                   zerolinecolor=GREY_PALE),
+    )
+)
+pio.templates.default = "pead"
+
+_BUNDLE = {"used": False}
+
+
+def show(fig):
+    """Render a Plotly figure with one shared inline plotly.js bundle.
+
+    The first chart embeds the bundle (offline-safe, no CDN); the rest reuse
+    it. Displays immediately (works mid-cell, not just as the last expression).
+    """
+    first = not _BUNDLE["used"]
+    _BUNDLE["used"] = True
+    display(HTML(fig.to_html(include_plotlyjs=True if first else False,
+                             full_html=False,
+                             config={"responsive": True})))
+
+
+def hist_bars(s, bins=60, lo=None, hi=None):
+    """Pre-bin a series to (centers, counts) so the HTML stays small."""
+    v = pd.Series(s).dropna().to_numpy(dtype=float)
+    if lo is None:
+        lo = float(np.min(v))
+    if hi is None:
+        hi = float(np.max(v))
+    counts, edges = np.histogram(v, bins=bins, range=(lo, hi))
+    return (edges[:-1] + edges[1:]) / 2, counts
+
+CLASS_NAMES = ["Low <2%", "Mod 2–4%", "Strong ≥4%"]
+```
+
+## 1. The problem: drift after earnings
+
+Every quarter, listed companies publish results: revenue, profit and
+guidance. If markets digested this instantly, the price would reset within
+minutes and then wander randomly. In practice it keeps moving. Ball and
+Brown (1968) were the first to document the effect, and Bernard and Thomas
+(1989) estimated a hedge portfolio built on it at about **25% abnormal
+return per year**. The finding has held up for decades: **prices tend to keep
+moving in the direction of the earnings surprise for days or weeks after the
+announcement**. This is known as post-earnings-announcement drift (PEAD).
+
+The usual explanations for why the effect survives:
+
+- **Slow updating.** Earnings reports are information-heavy, and investors
+  and analysts adjust their views gradually rather than all at once.
+- **Arbitrage is hard where drift is strongest.** The effect is biggest in
+  volatile, less liquid, harder-to-short stocks and in uncertain markets,
+  which is exactly where large investors have the least room to act.
+- **Behavioural effects.** Limited attention, reluctance to sell winners or
+  losers, and follow-up news (analyst revisions, media coverage) all stretch
+  out the adjustment.
+
+The traditional signal is **standardised unexpected earnings (SUE)**, the gap
+between reported and expected EPS, often paired with recent price momentum.
+No single input fully explains the drift, though. Price behaviour,
+fundamentals, management tone, news sentiment and the market environment each
+explain part of it. This project tries to bring them together.
+
+**Research question:** can one model that combines technical, fundamental and
+text signals predict both the *direction* and the *size* of post-earnings
+drift well enough to trade on it, and which of those signals actually
+matter?
+
+The practical decision (hold or exit after earnings) is framed as a
+supervised learning problem with **two targets per earnings event**: a class
+for the strength of the move (Low / Moderate / Strong) and the size of the
+peak return itself. The timeline below sets the conventions used throughout.
+
+```{python}
+#| label: fig-task-timeline
+#| fig-cap: "Task timeline in trading days around the earnings date (t=0). Features stop at the t+1 close; the target is the peak high over t+2…t+10. Entry at t+1, exit at the take-profit hit or t+10."
+fig = go.Figure()
+fig.add_vrect(x0=-10.5, x1=1.5, fillcolor=BLUE_PALE, opacity=0.6, line_width=0)
+fig.add_vrect(x0=1.5, x1=10.5, fillcolor=BLUE_LIGHT, opacity=0.45, line_width=0)
+fig.add_vline(x=0, line_dash="dot", line_color=INK)
+fig.add_vline(x=1, line_dash="dash", line_color=BLUE)
+fig.add_vline(x=10, line_dash="dash", line_color=BLUE_DARK)
+fig.add_annotation(x=-4.5, y=1.06, text="Feature window t−10 … t+1", showarrow=False)
+fig.add_annotation(x=6, y=1.06, text="Target window t+2 … t+10 (peak high)", showarrow=False)
+fig.add_annotation(x=0, y=0.5, text="earnings<br>t=0", showarrow=False)
+fig.add_annotation(x=1, y=0.2, text="entry<br>t+1 close", showarrow=False, font_color=BLUE)
+fig.add_annotation(x=10, y=0.2, text="exit<br>t+10", showarrow=False, font_color=BLUE_DARK)
+fig.update_xaxes(range=[-11, 11], tickmode="linear", tick0=-10, dtick=1,
+                 title="Trading days relative to earnings")
+fig.update_yaxes(visible=False, range=[0, 1.15])
+fig.update_layout(height=280, margin=dict(t=40, b=30))
+show(fig)
+```
+
+The one-day gap between the inputs and the target is the key rule of the
+setup: nothing observed after the t+1 close is allowed into the features. That
+keeps every entry realistic. The model only uses information an investor
+would actually have had at the entry price.
+
+## 2. Data coverage
+
+The data spans S&P 500 constituents from January 2014 to May 2026:
+**503 unique symbols** and **24,048 quarterly earnings events**, about one row
+per company per quarter. Event counts grow over time as price history builds
+up and index membership changes.
+
+```{python}
+#| label: fig-events-year
+#| fig-cap: "Earnings events per calendar year. 2014 starts mid-history; 2026 is a partial year and is excluded from model evaluation."
+ev = (pl.scan_parquet(DATA / "tech_modeling_table.parquet")
+        .select(["earnings_date"]).collect().to_pandas())
+ev["year"] = pd.to_datetime(ev.earnings_date).dt.year
+yc = ev.year.value_counts().sort_index().reset_index()
+yc.columns = ["year", "events"]
+print(f"symbols: 503 | events: {len(ev):,} | "
+      f"span: {ev.earnings_date.min().date()} → {ev.earnings_date.max().date()}")
+fig = px.bar(yc, x="year", y="events",
+             labels={"year": "Year", "events": "Earnings events"})
+fig.update_xaxes(tickmode="linear", dtick=1)
+fig.update_layout(height=380)
+show(fig)
+```
+
+### 2.1 Sectors
+
+Technology, Industrials and Financial Services contribute the most events,
+and Energy and Basic Materials the fewest, which matches the make-up of the
+index. Sector labels are joined from the company-info table on
+`(symbol, earnings_date)` with a 100% match rate; the 149 events with no
+sector appear as Unassigned.
+
+```{python}
+#| label: fig-sector-mix
+#| fig-cap: "Events per sector. The sample is the S&P 500 itself, so Tech/Industrials/Financials dominate."
+sec = (pl.read_parquet(DATA / "nz_sentiment.parquet")
+         .select(["symbol", "reportedDate", "sector"]))
+tsec = (pl.read_parquet(DATA / "tech_modeling_table.parquet")
+          .select(["symbol", "earnings_date", "target_return"])
+          .join(sec, left_on=["symbol", "earnings_date"],
+                right_on=["symbol", "reportedDate"], how="left")
+          .with_columns(pl.col("sector").fill_null("Unassigned")))
+sc = (tsec.group_by("sector")
+            .agg(pl.len().alias("events"),
+                 pl.col("target_return").mean().alias("mean_peak"))
+            .sort("events", descending=True).to_pandas())
+fig = px.bar(sc, x="events", y="sector", orientation="h",
+             hover_data={"mean_peak": ":.3f"},
+             labels={"events": "Earnings events", "sector": "",
+                     "mean_peak": "Mean peak return"})
+fig.update_layout(height=420, yaxis=dict(autorange="reversed"))
+show(fig)
+```
+
+```{python}
+#| label: fig-companies
+#| fig-cap: "The 12 largest companies per selected sector (use the dropdown), ranked by market capitalisation. Bar colour tracks mean peak return."
+sec_all = (pl.read_parquet(DATA / "nz_sentiment.parquet")
+             .select(["symbol", "reportedDate", "sector"]))
+tsec_all = (pl.read_parquet(DATA / "tech_modeling_table.parquet")
+              .select(["symbol", "earnings_date", "target_return"])
+              .join(sec_all, left_on=["symbol", "earnings_date"],
+                    right_on=["symbol", "reportedDate"], how="left")
+              .with_columns(pl.col("sector").fill_null("Unassigned")))
+co = pl.read_parquet(DATA / "company_info.parquet")
+sym = (tsec_all.group_by(["sector", "symbol"])
+                 .agg(pl.len().alias("events"),
+                      pl.col("target_return").mean().alias("mean_peak"))
+                 .join(co.select(["symbol", "company", "marketCap"]),
+                       on="symbol", how="left")
+                 .with_columns((pl.col("marketCap") / 1e9).alias("mcap_b"))
+                 .to_pandas())
+samp = (sym.sort_values(["sector", "marketCap"],
+                        ascending=[True, False])
+           .groupby("sector").head(12))
+order = (samp.groupby("sector").events.sum()
+             .sort_values(ascending=False).index.tolist())
+gmin, gmax = float(samp.mean_peak.min()), float(samp.mean_peak.max())
+fig = go.Figure()
+for k, s in enumerate(order):
+    d = samp[samp.sector == s].reset_index(drop=True)
+    fig.add_trace(go.Bar(
+        x=d.mcap_b.tolist(),
+        y=d.symbol.tolist(),
+        orientation="h",
+        marker=dict(colorscale="Greens",
+                    color=d.mean_peak.tolist(),
+                    cmin=gmin, cmax=gmax,
+                    colorbar=dict(title="Mean peak") if k == 0 else None,
+                    showscale=(k == 0)),
+        customdata=d[["company", "mcap_b", "events",
+                      "mean_peak"]].values.tolist(),
+        hovertemplate="<b>%{y}</b><br>%{customdata[0]}<br>"
+                      "Market cap: $%{customdata[1]:.1f}B<br>"
+                      "Events: %{customdata[2]}<br>"
+                      "Mean peak: %{customdata[3]:.3f}<extra></extra>",
+        texttemplate="$%{x:.0f}B",
+        textposition="outside",
+        cliponaxis=False,
+        visible=(k == 0),
+        name=s))
+fig.update_layout(
+    height=520, margin=dict(t=80, l=70, r=70, b=30),
+    xaxis_title="Market capitalisation ($B)",
+    yaxis=dict(autorange="reversed"),
+    title=dict(text=f"{order[0]}: 12 largest companies", x=0.5),
+    updatemenus=[dict(active=0,
+                      buttons=[dict(label=s, method="update",
+                                    args=[{"visible": [t == k for t in range(len(order))]},
+                                          {"title.text": f"{s}: 12 largest companies"}])
+                               for k, s in enumerate(order)],
+                      x=0, y=1.02, xanchor="left", yanchor="bottom")])
+show(fig)
+print(f"sample: {samp['symbol'].nunique()} companies across "
+      f"{samp['sector'].nunique()} sectors")
+```
+
+The drift is not driven by technology stocks alone. Average peak returns are
+close across all sectors, so the effect is market-wide. That is why the
+models are trained on all stocks together instead of separately per sector.
+
+```{python}
+#| label: fig-sector-target
+#| fig-cap: "Mean peak return (t+2…t+10 high vs t+1 close) by sector, with event counts. The band is narrow: PEAD is broad-based, not concentrated."
+fig = px.bar(sc.sort_values("mean_peak"), x="mean_peak", y="sector",
+             orientation="h", text="events",
+             labels={"mean_peak": "Mean peak return (decimal)",
+                     "sector": "", "events": "Events"})
+fig.update_layout(height=420, yaxis=dict(autorange="reversed"))
+show(fig)
+print(sc.round(4).to_markdown(index=False))
+```
+
+## 3. Earnings results and fundamentals
+
+For each event the data includes reported EPS, the consensus estimate, the
+surprise, and a small set of accounting fundamentals: growth, margins,
+leverage, cash generation and ROE (definitions in
+`docs/fundamental_indicators.md`).
+
+```{python}
+#| label: fig-surprise
+#| fig-cap: "EPS surprise distribution (clipped to −50%…+150% for display; raw tails reach −111% / +200%). Most surprises are small positive beats."
+fu = pl.read_parquet(DATA / "modeling_fundamentals.parquet")
+f = fu.select(["surprise", "surprisePercentage"]).to_pandas()
+beat = (f.surprise > 0).mean(); miss = (f.surprise < 0).mean(); met = 1 - beat - miss
+print(f"beat {beat:.1%} | met {met:.1%} | miss {miss:.1%}  (n={len(f):,})")
+clip = f.surprisePercentage.clip(-50, 150)
+cx, cy = hist_bars(clip, bins=80, lo=-50, hi=150)
+fig = go.Figure(go.Bar(x=cx, y=cy))
+fig.update_layout(height=360, xaxis_title="EPS surprise (%)",
+                  yaxis_title="Events")
+fig.add_vline(x=float(f.surprisePercentage.median()), line_dash="dash",
+              line_color=GREY,
+              annotation_text=f"median {f.surprisePercentage.median():.1f}%")
+fig.update_layout(height=360)
+show(fig)
+```
+
+Close to three out of four companies beat estimates. This is a familiar
+pattern: analysts' expectations tend to be walked down before the release.
+The real question is whether a *bigger* surprise leads to a *bigger* drift.
+
+```{python}
+#| label: fig-surprise-vs-target
+#| fig-cap: "EPS surprise vs realised peak drift (4,000-event sample). Correlation is near zero: knowing the beat size tells you almost nothing about the drift size."
+j = (pl.read_parquet(DATA / "tech_modeling_table.parquet")
+       .select(["symbol", "earnings_date", "target_return"])
+       .join(fu.select(["symbol", "reportedDate", "surprise", "surprisePercentage"]),
+             left_on=["symbol", "earnings_date"],
+             right_on=["symbol", "reportedDate"], how="inner")
+       .to_pandas())
+r = j.surprisePercentage.corr(j.target_return)
+s = j.sample(4000, random_state=7)
+fig = px.scatter(s, x="surprisePercentage", y="target_return", opacity=0.35,
+                 labels={"surprisePercentage": "EPS surprise (%)",
+                         "target_return": "Peak return (decimal)"})
+fig.update_xaxes(range=[-50, 150])
+fig.add_annotation(x=100, y=0.28, text=f"r = {r:.3f}", showarrow=False)
+fig.update_layout(height=380)
+show(fig)
+print(f"correlation(surprise %, peak return) = {r:.4f}")
+g = (j.assign(group=j.surprise.apply(lambda x: "beat" if x > 0 else ("miss" if x < 0 else "met")))
+      .groupby("group").target_return.agg(["mean", "count"]).round(4))
+print(g.to_markdown())
+```
+
+On average, beats, in-line results and misses all reach peaks within about
+one percentage point of each other. This is one of the most important
+findings in the project, and it explains why a strategy built on one signal
+falls short: **the surprise explains the jump on announcement day, but what
+happens afterwards depends on other factors**, mainly volatility,
+positioning and market regime, as the next sections show.
+
+The fundamentals describe a typical large-cap US company: profitable,
+generating cash, and moderately leveraged.
+
+```{python}
+#| label: tbl-fundamentals
+med = fu.select(["revenue_growth_qoq", "gross_margin", "debt_to_equity",
+                 "fcf_margin", "roe"]).to_pandas().median().round(4)
+print(pd.DataFrame({"median": med}).to_markdown())
+```
+
+## 4. How prices move after earnings
+
+### 4.1 When the peak happens
+
+The target is the highest intraday high over trading days t+2 to t+10. The
+day of that peak follows a U shape: it most often falls on day 2 (the move
+continues straight away) or day 10 (a slow climb to the end of the window),
+and least often in the middle.
+
+```{python}
+#| label: fig-max-day
+#| fig-cap: "Distribution of max_day: trading day of the peak high. U-shaped: fast follow-through or slow burn, rarely mid-window."
+md = (pl.scan_parquet(DATA / "tech_modeling_table.parquet")
+        .select(["max_day"]).collect().to_pandas())
+mc = md.max_day.value_counts().sort_index().reset_index()
+mc.columns = ["day", "events"]
+fig = px.bar(mc, x="day", y="events",
+             labels={"day": "Day of peak high (t+day)", "events": "Events"})
+fig.update_xaxes(tickmode="linear", dtick=1)
+fig.update_layout(height=380)
+show(fig)
+print(f"mean {md.max_day.mean():.1f} days | median {md.max_day.median():.0f} | "
+      f"day-2 share {mc.loc[0,'events']/len(md):.1%} | day-10 share {mc.loc[8,'events']/len(md):.1%}")
+```
+
+This matters for how a strategy exits. A fixed holding period only captures
+one of the two peaks, while a take-profit rule can capture either one. This
+is the reasoning behind the Strat-1/2/3 tests in §8.
+
+### 4.2 Market volatility at entry
+
+Market volatility at entry is the observable factor most closely linked to
+drift. The median VIX at t+1 is about 16.5, and when the VIX is high,
+realised peaks are higher too, which can be read as a reward for holding
+through rough markets.
+
+```{python}
+#| label: fig-vix
+#| fig-cap: "Left: VIX at entry (t+1). Right: mean peak return by VIX decile: drift rises monotonically with market volatility."
+vx = (pl.scan_parquet(DATA / "tech_modeling_table.parquet")
+        .select(["vix_close_t+1", "target_return"]).collect().to_pandas())
+vxb = vx.copy()
+vxb["decile"] = pd.qcut(vxb["vix_close_t+1"], 10, labels=False, duplicates="drop")
+g = vxb.groupby("decile").agg(vix=("vix_close_t+1", "mean"),
+                              peak=("target_return", "mean")).reset_index()
+fig = make_subplots(rows=1, cols=2, subplot_titles=("VIX at t+1", "Peak return by VIX decile"))
+vxlo, vxhi = float(vx["vix_close_t+1"].quantile(0.001)), float(vx["vix_close_t+1"].quantile(0.999))
+bx, by = hist_bars(vx["vix_close_t+1"], bins=60, lo=vxlo, hi=vxhi)
+fig.add_trace(go.Bar(x=bx, y=by, name="events"), 1, 1)
+fig.add_trace(go.Scatter(x=g.vix, y=g.peak, mode="lines+markers",
+                         name="mean peak", line=dict(color=BLUE),
+                         marker=dict(color=BLUE)), 1, 2)
+fig.update_xaxes(title_text="VIX close", row=1, col=1)
+fig.update_xaxes(title_text="Mean VIX in decile", row=1, col=2)
+fig.update_yaxes(title_text="Mean peak return", row=1, col=2)
+fig.update_layout(showlegend=False, height=360)
+show(fig)
+print(f"median VIX at entry: {vx['vix_close_t+1'].median():.1f}")
+```
+
+### 4.3 The target variable
+
+Peak returns average about 4.3% (std ≈4.5%, median ≈3.2%), with a long right
+tail of large moves. With classes defined as Low <2%, Moderate 2–4% and
+Strong ≥4%, Strong is the largest group (about 40%), and always predicting the
+most common class gives a baseline directional accuracy of 0.332.
+
+```{python}
+#| label: fig-target-dist
+#| fig-cap: "Peak-return distribution (left) and class mix (right). Right-skewed drift with a fat tail of large moves."
+df = (pl.scan_parquet(DATA / "tech_modeling_table.parquet")
+        .select(["target_return", "target_class"]).collect().to_pandas())
+fig = make_subplots(rows=1, cols=2, subplot_titles=("Peak return (decimal)", "Class mix"))
+tx, ty = hist_bars(df.target_return, bins=60)
+fig.add_trace(go.Bar(x=tx, y=ty, name="events"), 1, 1)
+mix = df.target_class.value_counts().sort_index()
+fig.add_trace(go.Bar(x=CLASS_NAMES, y=mix.values, name="n"), 1, 2)
+fig.update_layout(showlegend=False, height=380, bargap=0.3)
+show(fig)
+print(f"mean {df.target_return.mean():.4f} | std {df.target_return.std():.4f} | "
+      f"median {df.target_return.median():.4f}")
+```
+
+## 5. Text signals: earnings calls and news
+
+The models get two text-based inputs. FinBERT scores each earnings-call
+transcript (positive and negative probabilities, weighted by length per
+event). News headlines are scored separately for the windows before and
+after the announcement, weighted by relevance (`sentiment_stg.py`). Only the
+scores are kept for modelling; the raw text is dropped.
+
+```{python}
+#| label: fig-finbert
+#| fig-cap: "FinBERT transcript sentiment per event. Calls skew positive (management teams present good news), so the usable signal is in the cross-event differences, not the level."
+fb = pl.read_parquet(DATA / "finbert_tx_agg_weighted.parquet").to_pandas()
+fb = fb.dropna(subset=["pos_prob", "neg_prob"])
+fig = make_subplots(rows=1, cols=2, subplot_titles=("Positive prob", "Negative prob"))
+px_, py_ = hist_bars(fb.pos_prob, bins=50)
+fig.add_trace(go.Bar(x=px_, y=py_, name="pos"), 1, 1)
+nx, ny = hist_bars(fb.neg_prob, bins=50)
+fig.add_trace(go.Bar(x=nx, y=ny, name="neg"), 1, 2)
+fig.update_layout(showlegend=False, height=340)
+show(fig)
+print(f"mean pos {fb.pos_prob.mean():.3f} | mean neg {fb.neg_prob.mean():.3f} "
+      f"(n={len(fb):,} scored; 8 events without transcript scores)")
+```
+
+```{python}
+#| label: fig-news
+#| fig-cap: "News sentiment barely moves around the event (pre ≈ post ≈ +0.18 on both overall and ticker scores; note the zoomed axis): the news cycle reacts, but tone carries no incremental signal."
+nz = pl.read_parquet(DATA / "nz_sentiment.parquet").to_pandas()
+gm = pd.DataFrame({
+    "window": ["Overall pre", "Overall post", "Ticker pre", "Ticker post"],
+    "mean": [nz.overall_sentiment_score_pre.mean(),
+             nz.overall_sentiment_score_post.mean(),
+             nz.ticker_sentiment_score_pre.mean(),
+             nz.ticker_sentiment_score_post.mean()]})
+fig = px.bar(gm, x="window", y="mean", text="mean",
+             labels={"window": "", "mean": "Mean sentiment score"})
+fig.update_traces(texttemplate="%{text:.3f}", textposition="outside",
+                  cliponaxis=False)
+lo, hi = float(gm["mean"].min()), float(gm["mean"].max())
+pad = (hi - lo) * 0.6 + 0.001
+fig.update_yaxes(range=[lo - pad, hi + pad])
+fig.update_layout(height=360)
+show(fig)
+print(gm.round(4).to_markdown(index=False))
+```
+
+The charts already suggest a limitation that §7 confirms: call language is
+mostly positive and backward-looking, news tone barely changes around the
+announcement, and the target is an intraday price peak. As a result, the
+models rely mostly on volatility, and sentiment adds very little measurable
+value.
+
+## 6. How the models are set up
+
+Each earnings event becomes one row with **258 features**: 18 TA-Lib
+technical indicators over 12 trading days (216 columns: RSI, MACD, ROC, EMAs,
+ADX, ATR, Bollinger, volatility, OBV, VWAP, all normalised across stocks),
+plus 12 VIX values, 2 FinBERT transcript scores, 4 news-sentiment scores,
+12 fundamentals and 12 sector dummies. The imputer and scaler are fitted on
+the training folds only.
+
+```{python}
+#| label: fig-features
+#| fig-cap: "The 258 feature columns per earnings event. Pivoted technical sequences dominate; language and fundamentals are thin slices."
+parts = pd.DataFrame({
+    "block": ["Technical 18×12d", "VIX 12d", "FinBERT transcript",
+              "News sentiment", "Fundamentals", "Sector dummies"],
+    "n": [216, 12, 2, 4, 12, 12]})
+fig = px.bar(parts, x="n", y="block", orientation="h", text="n", color="block",
+             color_discrete_sequence=[BLUE, BLUE_MID, BLUE_DARK,
+                                      BLUE_LIGHT, GREY, GREY_PALE],
+             labels={"n": "Columns", "block": ""})
+fig.update_traces(textposition="outside", cliponaxis=False)
+fig.update_layout(height=320, showlegend=False,
+                  yaxis=dict(autorange="reversed"),
+                  margin=dict(l=140, r=40))
+show(fig)
+```
+
+Models are evaluated with a **20-fold expanding walk-forward** across test
+quarters 2021 Q1 to 2025 Q4 (TabNet; the DNN covers 16 folds from 2022 Q1,
+7,967 test rows vs 9,937). Each fold trains on all earlier data and tests on
+the next quarter, so no model is ever trained on information from its own
+future. That is the right way to test a market model.
+
+```{python}
+#| label: fig-walkforward
+#| fig-cap: "Expanding walk-forward, reconstructed live from event dates. Training history grows every fold (top) while validation (prior quarter) and test (held-out quarter) roll forward (bottom). The DNN run covers the same structure from 2022 Q1."
+ev = pd.to_datetime(pl.scan_parquet(
+    DATA / "tech_modeling_table.parquet").select(
+    ["earnings_date"]).collect().to_pandas().earnings_date)
+res = pl.read_parquet(DATA / "tabnet_updated_results.parquet").to_pandas()
+folds = res[["fold_num", "quarter"]].drop_duplicates().sort_values("fold_num")
+tr_n, va_n, te_n, qs = [], [], [], []
+for _, r in folds.iterrows():
+    y, q = map(int, r.quarter.split("_Q"))
+    t0 = pd.Timestamp(y, 3 * (q - 1) + 1, 1)
+    v0 = t0 - pd.DateOffset(months=3)
+    tr_n.append(int((ev < v0).sum()))
+    va_n.append(int(((ev >= v0) & (ev < t0)).sum()))
+    te_n.append(int((res.fold_num == r.fold_num).sum()))
+    qs.append(r.quarter)
+fig = make_subplots(
+    rows=2, cols=1, shared_xaxes=True, row_heights=[0.55, 0.45],
+    subplot_titles=("Training events (expanding history)",
+                    "Validation + test events per fold"))
+fig.add_trace(go.Scatter(x=qs, y=tr_n, mode="lines+markers", name="train",
+                         line=dict(color=BLUE), marker=dict(color=BLUE),
+                         fill="tozeroy",
+                         fillcolor="rgba(174,203,235,0.5)"), 1, 1)
+fig.add_trace(go.Bar(x=qs, y=va_n, name="validation (prior quarter)",
+                     marker_color=BLUE_MID), 2, 1)
+fig.add_trace(go.Bar(x=qs, y=te_n, name="test (held-out quarter)",
+                     marker_color=BLUE_DARK), 2, 1)
+fig.update_xaxes(tickangle=-60, tickfont=dict(size=11),
+                 title_text="Test quarter", row=2, col=1)
+fig.update_yaxes(title_text="Events", row=1, col=1)
+fig.update_yaxes(title_text="Events", row=2, col=1)
+fig.update_layout(height=600, margin=dict(b=110), barmode="group",
+                  legend=dict(orientation="h", yanchor="bottom",
+                              y=1.02, xanchor="right", x=1))
+show(fig)
+print(f"train history {tr_n[0]:,} → {tr_n[-1]:,} events; "
+      f"val/test ≈ {sum(va_n) / len(va_n):.0f}/{sum(te_n) / len(te_n):.0f} "
+      f"events per fold")
+```
+
+The models were built up step by step, from testing each signal group to
+measuring what it adds:
+
+1. **B1–B4 ablation (Random Forest / XGBoost):** signal groups added one at
+   a time: B1 technical (239 features), B2 + fundamentals/sector (250),
+   B3 + transcript (254), B4 + news (258). Directional accuracy falls
+   steadily from B1 0.4505 to B4 0.4430 and pooled R² drops too, so each
+   extra group adds noise rather than signal (`docs/b1-b4_ablation.md`).
+2. **Reproducing the base paper** (Hajek et al. 2025, LSTM/BiLSTM/CNN-LSTM):
+   on our harder peak-return target, the LSTM reaches RMSE ≈4.48 and
+   DA ≈42.6%. The model ranking matches the paper's CAR-based results, with
+   the expected gap in absolute numbers
+   (`src/modeling/basepaper/base_paper_reproduction.ipynb`).
+3. **TabNet:** a classifier and a regressor trained per fold on a Modal T4 GPU
+   (`src/modeling/tabnet/modal_tabnet_pead.py`). Optuna tuning in
+   `tabnet_pruned.ipynb` adds only 2–4 points, which points to a ceiling in
+   the data rather than in the model.
+4. **Multitask DNN:** a shared [256,128,64] encoder with BatchNorm, ReLU and
+   Dropout(0.3), trained on a combined loss `α·CE + (1−α)·MSE`
+   (`multitask_dnn_updates.ipynb`).
+
+## 7. Model results
+
+Both models beat the 0.332 majority-class baseline by 12–13 points. The DNN
+is slightly ahead of TabNet on direction (0.457 vs 0.450) and on error (RMSE
+0.0428 vs 0.0446). Directional accuracy recomputed from the individual
+predictions matches the saved fold summaries to within 0.001. One note on
+versions: the strategy notebooks trade the earlier `results.parquet` run
+(DA 0.4371), so §8 replays that run to keep the numbers consistent, while
+this section compares the best runs available.
+
+```{python}
+#| label: tbl-model-means
+#| output: false
+tab = pl.read_parquet(DATA / "tabnet_updated_per_fold_summary.parquet")
+dnn = pl.read_parquet(DATA / "dnn_per_fold_summary.parquet")
+cmp = pd.DataFrame([
+  {"model": "TabNet (updated, 20 folds, 9,937 rows)",
+   "DA": tab["DA"].mean(), "MAE": tab["MAE"].mean(), "RMSE": tab["RMSE"].mean()},
+  {"model": "Multitask DNN (16 folds, 7,967 rows)",
+   "DA": dnn["DA"].mean(), "MAE": dnn["MAE"].mean(), "RMSE": dnn["RMSE"].mean()},
+  {"model": "Majority-class baseline", "DA": 0.332,
+   "MAE": float("nan"), "RMSE": float("nan")},
+])
+print(cmp.round(4).to_markdown(index=False))
+```
+
+```{python}
+#| label: fig-perfold
+#| fig-cap: "Directional accuracy by test quarter for both models (dashed = means). 2022 Q4 is easy for every model; 2024–25 quarters sit near baseline. That is regime variance, not a modelling bug."
+tp = tab.to_pandas()[["quarter", "DA"]].assign(model="TabNet")
+dp = dnn.to_pandas()[["quarter", "DA"]].assign(model="DNN")
+both = pd.concat([tp, dp])
+fig = px.bar(both, x="quarter", y="DA", color="model", barmode="group",
+             color_discrete_sequence=[BLUE, TEAL],
+             hover_data=["model"],
+             labels={"quarter": "Test quarter", "DA": "Directional accuracy"})
+for m, v in [("TabNet", tp.DA.mean()), ("DNN", dp.DA.mean())]:
+    fig.add_hline(y=v, line_dash="dash", line_color=GREY,
+                  annotation_text=f"{m} {v:.3f}")
+fig.update_xaxes(tickangle=-60, tickfont=dict(size=11))
+fig.update_layout(height=460, margin=dict(b=110), bargap=0.25)
+show(fig)
+```
+
+### 7.1 Where the models go wrong
+
+```{python}
+#| label: fig-confusion
+#| fig-cap: "Confusion matrices (row-normalised). Both models spot Strong moves well and blur Low vs Moderate: the expensive boundary for a take-profit strategy."
+rt = pl.read_parquet(DATA / "tabnet_updated_results.parquet").to_pandas()
+rd = pl.read_parquet(DATA / "dnn_results.parquet").to_pandas()
+fig = make_subplots(rows=1, cols=2, subplot_titles=("TabNet", "Multitask DNN"))
+for k, r in enumerate([rt, rd]):
+    cm = confusion_matrix(r.target_class_actual, r.target_class_predicted,
+                          labels=[0, 1, 2])
+    cmn = cm / cm.sum(axis=1, keepdims=True)
+    fig.add_trace(go.Heatmap(z=cmn[::-1], x=CLASS_NAMES, y=CLASS_NAMES[::-1],
+                             zmin=0, zmax=1, colorscale="Blues",
+                             showscale=(k == 1),
+                             text=[[f"{v:.2f}" for v in row] for row in cmn[::-1]],
+                             texttemplate="%{text}"),
+                  1, k + 1)
+fig.update_xaxes(title_text="Predicted", row=1, col=1)
+fig.update_xaxes(title_text="Predicted", row=1, col=2)
+fig.update_yaxes(title_text="Actual", row=1, col=1)
+fig.update_layout(height=420)
+show(fig)
+```
+
+```{python}
+#| label: fig-pred-actual
+#| fig-cap: "Predicted vs realised peak return (3,000-event TabNet sample). Points hug the mean rather than the diagonal. The regressor ranks more than it pins down."
+s = rt.sample(3000, random_state=11)
+fig = px.scatter(s, x="target_return_predicted", y="target_return_actual",
+                 opacity=0.35, color="target_class_predicted",
+                 color_discrete_sequence=[BLUE_DARK, BLUE, BLUE_LIGHT],
+                 labels={"target_return_predicted": "Predicted peak return",
+                         "target_return_actual": "Realised peak return",
+                         "target_class_predicted": "Pred class"})
+lo = float(s[["target_return_predicted", "target_return_actual"]].min().min())
+hi = float(s[["target_return_predicted", "target_return_actual"]].max().max())
+fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
+                         line=dict(dash="dash", color=INK), name="perfect"))
+fig.update_layout(height=420)
+show(fig)
+```
+
+### 7.2 Using prediction confidence to rank risk
+
+For both models, the realised drift goes up steadily with the predicted
+class. That makes the prediction useful as a risk ranking, and it is this
+ordering, more than the raw accuracy, that the trading strategy profits from.
+
+```{python}
+#| label: fig-winconf
+#| fig-cap: "Left: hit-rate by predicted class. Right: realised mean drift by predicted class. Both rise monotonically. Conviction means something."
+rows = []
+for name, r in [("TabNet", rt), ("DNN", rd)]:
+    g = (r.groupby("target_class_predicted")
+           .agg(n=("target_class_actual", "size"),
+                mean_actual=("target_return_actual", "mean")))
+    g["hit"] = [float((r[r.target_class_predicted == c].target_class_actual
+                       == c).mean()) for c in g.index]
+    g = g.reset_index().assign(model=name)
+    rows.append(g)
+w = pd.concat(rows)
+w["cls"] = w.target_class_predicted.map(dict(enumerate(CLASS_NAMES)))
+fig = make_subplots(rows=1, cols=2, subplot_titles=("Hit-rate", "Realised mean drift"))
+series_colour = {"TabNet": BLUE, "DNN": TEAL}
+for m in ["TabNet", "DNN"]:
+    d = w[w.model == m]
+    fig.add_trace(go.Bar(x=d.cls, y=d.hit, name=m,
+                         marker_color=series_colour[m]), 1, 1)
+    fig.add_trace(go.Bar(x=d.cls, y=d.mean_actual, name=m, showlegend=False,
+                         marker_color=series_colour[m]), 1, 2)
+fig.update_yaxes(title_text="Hit-rate", row=1, col=1)
+fig.update_yaxes(title_text="Mean realised peak", row=1, col=2)
+fig.update_layout(height=380, bargap=0.3)
+show(fig)
+```
+
+## 8. Does it make money? Strategy backtest
+
+The rules follow `TABNET_STRAT_4.ipynb` and `DNN_STRAT_4.ipynb`: $50k of
+capital, $200 per trade, buy at the t+1 close whenever the predicted class is
+Moderate or Strong, and sell on the first day the high reaches `entry·(1+T)`,
+or otherwise at the t+10 close. Strat-1 uses a fixed T=2%; Strat-2 tests
+T from 1% to 5% and selects by Sharpe (best: T=5.0%); Strat-3 sells half the
+position at T/2. This section replays the selected **T=5%** live from the
+saved tables, using the same `results.parquet` run and the same filters as
+the notebooks (signals before 2026, complete t+2…t+10 windows), with no cash
+limit and no trading costs. As a check, running the same code at T=2%
+reproduces the notebook results exactly (8,221 trades, +$6,637).
+
+```{python}
+#| label: tbl-strat
+import datetime
+T, SIZE = 0.05, 200.0
+stx = pl.read_parquet(DATA / "strat_table.parquet")
+jh = ["high_t+2", "high_t+3", "high_t+4", "high_t+5", "high_t+6", "high_t+7",
+      "high_t+8", "high_t+9", "high_t+10"]
+jd = ["date_t+2", "date_t+3", "date_t+4", "date_t+5", "date_t+6", "date_t+7",
+      "date_t+8", "date_t+9", "date_t+10"]
+req = ["entry_price", "entry_date", "close_t10"] + jh + jd
+
+
+def replay(path):
+    r = (pl.read_parquet(path)
+           .filter(pl.col("target_class_predicted").is_in([1, 2]))
+           .filter(pl.col("earnings_date") < datetime.date(2026, 1, 1)))
+    m = (r.join(stx.select(["symbol", "date", "entry_date", "close_t10"]
+                           + jh + jd),
+                left_on=["symbol", "earnings_date"],
+                right_on=["symbol", "date"], how="left")
+           .drop_nulls(req))
+    rows = m.select(["entry_price"] + jh + jd + ["close_t10"]).to_dicts()
+    out = []
+    for x in rows:
+        tgt = x["entry_price"] * (1 + T)
+        hit, ex, exd = False, x["close_t10"], x["date_t+10"]
+        for h, d in zip(jh, jd):
+            if x[h] is not None and x[h] >= tgt:
+                hit, ex, exd = True, tgt, x[d]
+                break
+        out.append({"exit_date": exd, "hit": hit,
+                    "pnl": SIZE * (ex / x["entry_price"] - 1)})
+    tr = pd.DataFrame(out)
+    tr["exit_date"] = pd.to_datetime(tr.exit_date)
+    return len(r), len(m), tr
+
+
+n0, n1, tr_t = replay(DATA / "tabnet_results.parquet")
+_, _, tr_d = replay(DATA / "dnn_results.parquet")
+print(f"TabNet signals {n0:,} | matched {n1:,}")
+for name, tr in [("TabNet", tr_t), ("DNN", tr_d)]:
+    print(f"{name} T=5%: trades {len(tr):,} | hit-rate {tr.hit.mean():.1%} | "
+          f"total P&L ${tr.pnl.sum():,.0f} at ${SIZE:,.0f}/trade, no costs")
+```
+
+### 8.1 Choosing the take-profit level
+
+Testing T from 1% to 5%, total P&L rises steadily for both models while the
+hit rate drops by more than half. The simplified business-day Sharpe agrees
+with the notebooks that T=5% is the best choice (the notebooks' cash-limited
+Sharpe figures are higher: TabNet 2.33, DNN 1.77). The overlay chart shows
+the trade-off: higher targets grow faster but have deeper dips along the way.
+
+```{python}
+#| label: strat-panels
+#| output: false
+import datetime
+STX = pl.read_parquet(DATA / "strat_table.parquet")
+HH = [f"high_t+{d}" for d in range(2, 11)]
+LL = [f"low_t+{d}" for d in range(2, 11)]
+JJ = [f"date_t+{d}" for d in range(2, 11)]
+REQ = ["entry_price", "entry_date", "close_t10"] + HH + LL + JJ
+
+
+def panel_matrices(path):
+    r = (pl.read_parquet(path)
+           .filter(pl.col("target_class_predicted").is_in([1, 2]))
+           .filter(pl.col("earnings_date") < datetime.date(2026, 1, 1)))
+    m = (r.join(STX.select(["symbol", "date", "entry_date", "close_t10"]
+                           + HH + LL + JJ),
+                left_on=["symbol", "earnings_date"],
+                right_on=["symbol", "date"], how="left")
+           .drop_nulls(REQ))
+    E = m["entry_price"].to_numpy()
+    return dict(E=E,
+                RH=np.column_stack([m[c].to_numpy() for c in HH]) / E[:, None] - 1,
+                RL=np.column_stack([m[c].to_numpy() for c in LL]) / E[:, None] - 1,
+                D=np.column_stack([m[c].to_numpy() for c in JJ]),
+                C10=m["close_t10"].to_numpy() / E - 1,
+                pred=m["target_class_predicted"].to_numpy(),
+                exd10=m["date_t+10"].to_numpy(),
+                n=len(m))
+
+
+MAT_T = panel_matrices(DATA / "tabnet_results.parquet")
+MAT_D = panel_matrices(DATA / "dnn_results.parquet")
+
+
+def sharpe_bday(pnl, exd, cap=50000.0):
+    dp = pd.Series(np.asarray(pnl)).groupby(
+        pd.to_datetime(pd.Series(np.asarray(exd))).values).sum()
+    idx = pd.date_range(dp.index.min(), dp.index.max(), freq="B")
+    rs = dp.reindex(idx, fill_value=0.0) / cap
+    return float(rs.mean() / rs.std() * np.sqrt(252))
+
+
+def strat1_trades(M, T, size=200.0):
+    cross = M["RH"] > T
+    hit = cross.any(axis=1)
+    fi = np.argmax(cross, axis=1)
+    ret = np.where(hit, T, M["C10"])
+    exd = np.where(hit, M["D"][np.arange(M["n"]), fi], M["exd10"])
+    hold = np.where(hit, fi + 2, 10)
+    return ret * size, hit, hold, exd, ret
+```
+
+```{python}
+#| label: fig-sweep
+#| fig-cap: "Take-profit sweep, recomputed live for both models: P&L rises monotonically to T=5% while the simplified Sharpe agrees it is best."
+TS = [round(float(x), 4) for x in np.arange(0.01, 0.0525, 0.005)]
+sw = []
+for name, M in [("TabNet", MAT_T), ("DNN", MAT_D)]:
+    for T in TS:
+        pnl, hit, hold, exd, ret = strat1_trades(M, T)
+        sw.append({"model": name, "T": T, "pnl": float(pnl.sum()),
+                   "hit": float(hit.mean()),
+                   "sharpe": sharpe_bday(pnl, exd)})
+sw = pd.DataFrame(sw)
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+                    subplot_titles=("Total P&L ($) by take-profit",
+                                    "Simplified Sharpe by take-profit"))
+for m, col in [("TabNet", BLUE), ("DNN", TEAL)]:
+    d = sw[sw.model == m]
+    fig.add_trace(go.Bar(x=[f"{t:.1%}" for t in d.T], y=d.pnl,
+                         name=m, marker_color=col), 1, 1)
+    fig.add_trace(go.Bar(x=[f"{t:.1%}" for t in d.T], y=d.sharpe,
+                         name=m, showlegend=False,
+                         marker_color=col), 2, 1)
+fig.update_layout(height=560, barmode="group", margin=dict(t=80),
+                  legend=dict(orientation="h", yanchor="bottom",
+                              y=1.02, xanchor="right", x=1))
+show(fig)
+print(sw.round(3).to_markdown(index=False))
+```
+
+```{python}
+#| label: fig-sweep-equity
+#| fig-cap: "TabNet equity at three thresholds: higher take-profits compound harder with deeper interim dents."
+fig = go.Figure()
+for T, col in [(0.02, BLUE_LIGHT), (0.035, BLUE_MID), (0.05, BLUE)]:
+    pnl, hit, hold, exd, ret = strat1_trades(MAT_T, T)
+    eq = pd.Series(pnl).groupby(
+        pd.to_datetime(pd.Series(exd)).values).sum().cumsum()
+    fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines",
+                             name=f"T={T:.1%}", line=dict(color=col)))
+fig.update_layout(height=380, xaxis_title="Exit date",
+                  yaxis_title="Cumulative P&L ($)",
+                  legend=dict(orientation="h", yanchor="bottom",
+                              y=1.02, xanchor="right", x=1))
+show(fig)
+```
+
+### 8.2 Equity curve and drawdown
+
+At T=5%, both models grow steadily over the period, with one shared drawdown
+during the 2022 market-volatility episode.
+
+```{python}
+#| label: fig-equity
+#| fig-cap: "Replayed equity at the notebook-selected T=5%: both models compound steadily after entry, with a shared 2022 mid-year dent from the macro-volatility quarter."
+eq_t = tr_t.groupby("exit_date").pnl.sum().cumsum().reset_index()
+eq_d = tr_d.groupby("exit_date").pnl.sum().cumsum().reset_index()
+runmax = eq_t.pnl.cummax()
+dd = (eq_t.pnl - runmax)
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35],
+                    subplot_titles=("Cumulative P&L ($): TabNet vs DNN",
+                                    "TabNet drawdown from peak ($)"))
+fig.add_trace(go.Scatter(x=eq_t.exit_date, y=eq_t.pnl, mode="lines",
+                         name="TabNet",
+                         line=dict(color=BLUE)), 1, 1)
+fig.add_trace(go.Scatter(x=eq_d.exit_date, y=eq_d.pnl, mode="lines",
+                         name="DNN",
+                         line=dict(color=TEAL)), 1, 1)
+fig.add_trace(go.Scatter(x=eq_t.exit_date, y=dd, mode="lines", name="drawdown",
+                         showlegend=False,
+                         line=dict(color=BLUE_MID), fill="tozeroy",
+                         fillcolor="rgba(174,203,235,0.5)"), 2, 1)
+fig.update_layout(height=520, legend=dict(orientation="h", yanchor="bottom",
+                                          y=1.02, xanchor="right", x=1))
+show(fig)
+print(f"TabNet final ${eq_t.pnl.iloc[-1]:,.0f} | "
+      f"DNN final ${eq_d.pnl.iloc[-1]:,.0f} | "
+      f"TabNet deepest drawdown ${dd.min():,.0f}")
+```
+
+### 8.3 How trades exit
+
+At T=5%, about three in five TabNet trades never reach the target and close
+at t+10, while the rest lock in +$10 within a few days. Strong signals reach
+the target about twice as often as Moderate ones, so the model's confidence
+carries through to actual trade results.
+
+```{python}
+#| label: fig-exits
+#| fig-cap: "Left: holding period to exit at T=5% (TabNet). Right: per-trade return distribution with the +5% cap spike."
+pnl5, hit5, hold5, exd5, ret5 = strat1_trades(MAT_T, 0.05)
+hc = pd.Series(hold5).value_counts().sort_index()
+fig = make_subplots(rows=1, cols=2,
+                    subplot_titles=("Holding days to exit",
+                                    "Per-trade return"))
+fig.add_trace(go.Bar(x=[f"t+{int(d)}" for d in hc.index], y=hc.values,
+                     name="trades", marker_color=BLUE), 1, 1)
+rx, ry = hist_bars(ret5, bins=60, lo=-0.15, hi=0.10)
+fig.add_trace(go.Bar(x=rx, y=ry, name="trades", marker_color=BLUE,
+                     showlegend=False), 1, 2)
+fig.update_layout(height=360, showlegend=False)
+show(fig)
+tp = pd.DataFrame({"exit": ["take-profit", "t+10 close"],
+                   "n": [int(hit5.sum()), int((~hit5).sum())]})
+tp["share"] = (tp.n / tp.n.sum()).round(3)
+tp["pnl"] = [float(pnl5[hit5].sum()), float(pnl5[~hit5].sum())]
+print(tp.to_markdown(index=False))
+```
+
+```{python}
+#| label: fig-hitclass
+#| fig-cap: "Take-profit hit-rate by predicted class at T=5%: Strong signals convert far more often than Moderate ones under both models."
+rows = []
+for name, M in [("TabNet", MAT_T), ("DNN", MAT_D)]:
+    pnl, hit, hold, exd, ret = strat1_trades(M, 0.05)
+    df = pd.DataFrame({"cls": M["pred"], "hit": hit})
+    g = df.groupby("cls").hit.agg(["mean", "size"]).reset_index()
+    g["model"] = name
+    rows.append(g)
+w = pd.concat(rows)
+w["cls"] = w.cls.map({1: "Moderate (1)", 2: "Strong (2)"})
+fig = px.bar(w, x="cls", y="mean", color="model", barmode="group",
+             text="size", color_discrete_sequence=[BLUE, TEAL],
+             labels={"cls": "Predicted class", "mean": "Take-profit hit-rate",
+                     "model": "", "size": "Trades"})
+fig.update_layout(height=360,
+                  legend=dict(orientation="h", yanchor="bottom",
+                              y=1.02, xanchor="right", x=1))
+show(fig)
+```
+
+### 8.4 Selling in parts
+
+Selling part of the position early (Strat-3) locks in some profit sooner. A
+50/50 split performs best of the split options here (+$10,004 live; notebook
+Sharpe 2.23), but every split earns less than holding the full position
+(+$12,105), in exchange for a smoother equity curve.
+
+```{python}
+#| label: fig-split
+#| fig-cap: "Split-sell overlays at best T=5% (TabNet): banking part of the position early smooths the ride but leaves money on the table in this sample."
+def split_trades(M, frac, T=0.05, size=200.0):
+    a1, a2 = size * frac, size * (1 - frac)
+    pT = T * frac
+    pc = M["RH"] > pT
+    pi = np.argmax(pc, axis=1)
+    pdid = pc[np.arange(M["n"]), pi]
+    fc = M["RH"] > T
+    fi = np.argmax(fc, axis=1)
+    fdid = fc[np.arange(M["n"]), fi]
+    leg_pnl, leg_ex = [], []
+    for i in range(M["n"]):
+        if pdid[i]:
+            leg_pnl.append(a1 * pT)
+            leg_ex.append(M["D"][i, pi[i]])
+            if fdid[i]:
+                leg_pnl.append(a2 * T)
+                leg_ex.append(M["D"][i, fi[i]])
+            else:
+                leg_pnl.append(a2 * M["C10"][i])
+                leg_ex.append(M["exd10"][i])
+        else:
+            leg_pnl.append(size * M["C10"][i])
+            leg_ex.append(M["exd10"][i])
+    return np.array(leg_pnl), np.array(leg_ex)
+
+
+fig = go.Figure()
+res3 = []
+pnl0, _, _, exd0, _ = strat1_trades(MAT_T, 0.05)
+res3.append(("no split", pnl0, exd0))
+for frac, col in [(0.7, BLUE_LIGHT), (0.6, BLUE_MID), (0.5, BLUE_DARK)]:
+    lp, le = split_trades(MAT_T, frac)
+    res3.append((f"{int(frac * 100)}/{int((1 - frac) * 100)}", lp, le))
+for lbl, lp, le in res3:
+    col = {"no split": BLUE, "70/30": BLUE_LIGHT,
+           "60/40": BLUE_MID, "50/50": BLUE_DARK}[lbl]
+    eq = pd.Series(lp).groupby(
+        pd.to_datetime(pd.Series(le)).values).sum().cumsum()
+    fig.add_trace(go.Scatter(x=eq.index, y=eq.values, mode="lines", name=lbl,
+                             line=dict(color=col)))
+fig.update_layout(height=400, xaxis_title="Exit date",
+                  yaxis_title="Cumulative P&L ($)",
+                  legend=dict(orientation="h", yanchor="bottom",
+                              y=1.02, xanchor="right", x=1))
+show(fig)
+for lbl, lp, le in res3:
+    print(f"{lbl:>8}: P&L=${lp.sum():,.0f} win={(lp > 0).mean():.1%} "
+          f"Sharpe(simplified)={sharpe_bday(lp, le):.2f}")
+```
+
+### 8.5 Testing stop-losses
+
+Every stop-loss level below the 5% target earns less than using no stop at
+all. The notebook's Sharpe-selected -1% stop turns about three-quarters of
+trades into small -$2 losses (exit mix shown below) and cuts total P&L to
+$5,594. The profit comes from letting winning trades reach the target, not
+from cutting losing trades early.
+
+```{python}
+#| label: fig-sl
+#| fig-cap: "Stop-loss sweep at fixed take-profit 5% (TabNet, recomputed live): every stop level earns less than no stop."
+def sl_trades(M, sl, T=0.05, size=200.0):
+    ex = M["C10"].copy()
+    for k in range(9):
+        first = (ex == M["C10"])
+        slhit = M["RL"][:, k] < sl
+        tphit = M["RH"][:, k] > T
+        ex = np.where(first & slhit, sl, np.where(first & tphit, T, ex))
+    return ex * size
+
+
+sls = [-0.01, -0.02, -0.03, -0.04, -0.05]
+rows = [("no stop", strat1_trades(MAT_T, 0.05)[0])]
+for sl in sls:
+    rows.append((f"{sl:.0%}", sl_trades(MAT_T, sl)))
+fig = go.Figure(go.Bar(x=[r[0] for r in rows],
+                       y=[float(r[1].sum()) for r in rows],
+                       marker_color=BLUE))
+fig.update_layout(height=360, xaxis_title="Stop-loss (take-profit fixed at 5%)",
+                  yaxis_title="Total P&L ($)")
+show(fig)
+for lbl, lp in rows:
+    print(f"{lbl:>8}: P&L=${lp.sum():,.0f} win={(lp > 0).mean():.1%}")
+print("quoted notebook exit mix at SL=-1%: 74.9% stopped (-$2 avg), "
+      "19.4% take-profit (+$10 avg), 5.8% ride to t+10")
+```
+
+### 8.6 Results by year
+
+```{python}
+#| label: fig-ypnl
+#| fig-cap: "Net P&L by calendar year of exit (2026 partial year excluded). Every full year 2021–2025 is profitable for both models; 2022 absorbs the shared drawdown and still closes green."
+yrs = []
+for name, tr in [("TabNet", tr_t), ("DNN", tr_d)]:
+    g = tr[tr.exit_date.dt.year < 2026].copy()
+    g["year"] = g.exit_date.dt.year
+    yrs.append(g.groupby("year").pnl.sum().reset_index().assign(model=name))
+yp = pd.concat(yrs)
+fig = px.bar(yp, x="year", y="pnl", color="model", barmode="group",
+             color_discrete_sequence=[BLUE, TEAL],
+             labels={"year": "Exit year", "pnl": "Net P&L ($)", "model": ""})
+fig.update_xaxes(tickmode="linear", dtick=1)
+fig.update_layout(height=400, legend=dict(orientation="h", yanchor="bottom",
+                                          y=1.02, xanchor="right", x=1))
+show(fig)
+print(yp.pivot(index="year", columns="model", values="pnl").round(0).to_markdown())
+```
+
+```{python}
+#| label: fig-monthly
+#| fig-cap: "Top: net P&L by exit month (TabNet, T=5%). Bottom: 60-trade rolling take-profit hit-rate. Conviction holds above 60% in most windows, with the 2022 and early-2025 soft patches visible."
+pnlm, hitm, _, exdm, _ = strat1_trades(MAT_T, 0.05)
+tm = pd.DataFrame({"exit": pd.to_datetime(pd.Series(exdm)),
+                   "hit": hitm, "pnl": pnlm}).sort_values("exit")
+tm["month"] = tm.exit.dt.to_period("M").astype(str)
+mp = tm.groupby("month").pnl.sum().reset_index()
+roll = tm.hit.rolling(60).mean()
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5],
+                    subplot_titles=("Net P&L by month ($)",
+                                    "60-trade rolling take-profit hit-rate"))
+fig.add_trace(go.Bar(x=mp.month, y=mp.pnl, name="P&L",
+                     marker_color=[BLUE if v >= 0 else GREY
+                                   for v in mp.pnl]), 1, 1)
+fig.add_trace(go.Scatter(x=tm.exit, y=roll, mode="lines", name="hit-rate",
+                         line=dict(color=BLUE_DARK)), 2, 1)
+fig.update_xaxes(tickangle=-60, tickfont=dict(size=10), row=2, col=1)
+fig.update_layout(height=560, margin=dict(b=110), showlegend=False)
+show(fig)
+```
+
+At T=5%, the replay shows TabNet earning +$12,105 over 8,221 trades (38.0% hit
+rate) and the DNN +$7,861 over 5,648 trades (42.0% hit rate). Both are within
+a few tens of dollars of the cash-limited notebook results (+$12,138 over
+8,221 trades with 13 skipped, and +$7,774). Both models are profitable in
+every full year from 2021 to 2025. The losing quarters are spread out and
+mostly shared between the two models, 2022 Q2 in particular, which points to
+market conditions rather than model errors. Measured on deployed capital,
+the notebooks report at T=5%: +14.0% (2021), +7.0% (2022), +6.6% (2023),
++19.9% (2024) and +5.9% (2025).
+
+## 9. Key takeaways and limitations
+
+1. **Drift exists, but the earnings surprise doesn't explain it.** 73% of
+   companies beat estimates, yet beats and misses reach similar average
+   peaks, and surprise size has almost no correlation with drift size. A
+   single signal is not enough.
+2. **Volatility is what the models actually pick up.** VIX at entry rises in
+   step with realised drift. TabNet puts about 92.5% of its attention on
+   volatility and ATR features and under 0.5% on fundamentals and sentiment
+   combined. Predicting an intraday peak from daily and quarterly features
+   limits achievable R² to about 0.12–0.14. This ceiling comes from the data,
+   and tuning (+2–4 points) cannot move it.
+3. **A modest classifier can still rank risk well.** Hit rate and realised
+   drift both increase with predicted confidence (62% to 77%), and that is
+   what makes the output tradeable.
+4. **The economics hold up better than the statistics.** Classification
+   accuracy fell short of the published benchmark, but the strategy still
+   works: Sharpe 2.33, +$12,138 on $50k over about five years, and
+   profitable in every full year.
+
+**Limitations.** The backtest assumes no trading costs or slippage (a
+0/5/10/25bp cost grid is still to do). The take-profit level was chosen on the
+same data it was evaluated on, so it should be selected walk-forward. Sharpe
+figures at portfolio level and on deployed capital need to be kept separate.
+Risk reporting still lacks MaxDD/Calmar/Sortino, SPY and equal-weight
+benchmarks, and bootstrap confidence intervals. News coverage is limited by
+the API, the sample uses current index members only (survivorship bias), and
+2026 is a partial year left out of evaluation. A sensible path to real use
+would be paper trading first, then adding costs, then a small live
+allocation with oversight, with quarterly retraining and monitoring rather
+than fully automated trading.
+
+## Appendix A. Repository map
+
+| Repository area | How it is used in this report |
+|---|---|
+| `src/ingestion/*.py`, `src/preprocessing/*.py` (non-archive) | Described in §§2–5; not rerun here |
+| `src/data/model_staging/tech_modeling_table.parquet` | §§2–4 live exploratory analysis |
+| `src/data/model_staging/modeling_fundamentals.parquet` | §3 beats, misses and fundamentals |
+| `src/data/model_staging/{nz_sentiment, finbert_tx_agg_weighted}.parquet` | §2 sectors, §5 sentiment |
+| `src/data/model_staging/strat_table.parquet` | §8 live strategy replay |
+| `src/notebooks/EDA_final.ipynb` | Source for the §§2–5 analysis |
+| `src/modeling/b1-5/b*.ipynb` + `docs/b1-b4_ablation.md` | §6 ablation results |
+| `src/modeling/basepaper/base_paper_reproduction.ipynb` | §6 baseline results |
+| `src/modeling/tabnet/modal_tabnet_pead.py`, `modal_tabnet_analysis_updated_results.ipynb`, `tabnet_pruned.ipynb` | §7, recomputed from saved outputs |
+| `src/modeling/dnn/multitask_dnn_updates.ipynb` | §7, recomputed from saved outputs |
+| `TABNET_STRAT_4.ipynb`, `DNN_STRAT_4.ipynb` | §8 threshold sweep and live replay |
+| All `*/archive/*`, `fundamental.ipynb`, `ppt/ms7_rework.ipynb`, `class notes/`, `temp/` | Not used; see `src/report/data/README.md` |
+| `tech_daily_table.parquet` (594M), S3 backups, per-symbol FinBERT, `transcript_staging/` | Not included in the report data |
+
+## Appendix B. Metric definitions
+
+- **DA (directional accuracy):** share of correct 3-class predictions on the
+  held-out quarter (Low <2% / Moderate 2–4% / Strong ≥4% peak high over
+  **t+2…t+10**). Baseline 0.332.
+- **MAE / RMSE:** measured on the decimal `target_return` (×100 = percentage
+  points); the target has mean ≈4.3% and std ≈4.5%.
+- **Sharpe:** annualised portfolio Sharpe on the daily equity curve, reindexed
+  to all trading days. Deployed-capital and exit-day versions are reported
+  separately as diagnostics, not as the headline figure.
+- **Win rate (strategy):** share of trades that reach T before t+10 (different
+  from the classifier hit rate).
+

@@ -37,14 +37,14 @@ jobs:
         run: pip install -r src/report/requirements-report.txt
 
       - name: Render report
-        run: quarto render src/report/report.qmd --to html --output-dir "$GITHUB_WORKSPACE/src/out"
+        run: quarto render src/report/my_report.qmd --to html --output-dir "$GITHUB_WORKSPACE/src/out"
         env:
           QUARTO_PYTHON: python
 
       - name: Prepare site
         run: |
           mkdir -p site
-          cp src/out/report.html site/index.html
+          cp src/out/my_report.html site/index.html
 
       - uses: actions/upload-pages-artifact@v3
         with:
