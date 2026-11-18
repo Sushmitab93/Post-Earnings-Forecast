@@ -1,8 +1,11 @@
 # Post-Earnings Forecast
 
+> **Group capstone project**, Ontario Tech University, MBAI 5600G (Summer 2026), team of 3.
+> Forked from the original team repository: [Richard-X46/Post-Earnings-Forecast](https://github.com/Richard-X46/Post-Earnings-Forecast)
+
 Predict post-earnings-announcement drift (PEAD) for S&P 500 stocks: the target is the peak intraday high over the nine trading days (t+2…t+10) after each earnings event, predicted from technicals, fundamentals, sector, and FinBERT/news sentiment. ~24,000 events on ~500 constituents, evaluated on 20 expanding-window walk-forward folds (2021 Q1–2025 Q4).
 
-**[Read the interactive report](https://richard-pears.dev/pead-report/)**
+**[Read my interactive report](https://sushmitab93.github.io/Post-Earnings-Forecast/)**
 
 ![Project Workflow](Workflow.png)
 
@@ -26,7 +29,7 @@ docker build -f Dockerfile.report -t pead-report .
 docker run --rm -p 8080:80 pead-report   # http://localhost:8080
 ```
 
-Push to `main` renders in CI and ships `ghcr.io/richard-x46/post-earnings-forecast:latest` (`.github/workflows/docker-publish.yml`); the VPS serves it at the URL above via Caddy (`docker-compose.report.yml`).
+Push to `main` renders the report in CI and publishes it to GitHub Pages (`.github/workflows/pages.yml`).
 
 ## Results
 
